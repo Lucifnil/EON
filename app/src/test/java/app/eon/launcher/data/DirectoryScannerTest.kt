@@ -27,14 +27,53 @@ class DirectoryScannerTest {
     }
 
     @Test(timeout = 10000)
-    fun `directory aliases scan only once`() = runBlocking {
+    fun `directory aliases scan once in either order and keep the configured parent`() = runBlocking {
         val directory = folder.newFolder("original")
         directory.resolve("module.so").writeText("fixture")
         val alias = folder.root.resolve("alias")
         Files.createSymbolicLink(alias.toPath(), directory.toPath())
-        val result = DirectoryScanner(runner()).scan(listOf(directory.absolutePath, alias.absolutePath))
-        assertEquals(1, result.files.size)
+        val paths = listOf(directory.absolutePath, alias.absolutePath)
+        listOf(paths, paths.reversed()).forEach { configured ->
+            val result = DirectoryScanner(runner()).scan(configured)
+            assertTrue(result.errors.isEmpty())
+            assertEquals(listOf("${configured.first()}/module.so"), result.files.map { it.path })
+            assertTrue(ScanPathPolicy.allowsFile(configured, result.files.single().path))
+        }
+    }
+
+    @Test(timeout = 10000)
+    fun `configured directory replaced by a symlink still scans and can launch`() = runBlocking {
+        val directory = folder.newFolder("configured")
+        val module = directory.resolve("module.so").apply { writeText("fixture") }
+        assertTrue(module.setExecutable(true))
+        val target = folder.root.resolve("moved")
+        Files.move(directory.toPath(), target.toPath())
+        Files.createSymbolicLink(directory.toPath(), target.toPath())
+
+        val paths = listOf(directory.absolutePath)
+        val result = DirectoryScanner(runner()).scan(paths)
         assertTrue(result.errors.isEmpty())
+        assertEquals(listOf(module.absolutePath), result.files.map { it.path })
+        assertTrue(ScanPathPolicy.allowsFile(paths, result.files.single().path))
+        assertTrue(runner().isExecutableFile(result.files.single().path))
+    }
+
+    @Test(timeout = 10000)
+    fun `following configured directory does not follow child folders or file symlinks`() = runBlocking {
+        val directory = folder.newFolder("original")
+        directory.resolve("direct.so").writeText("fixture")
+        val nested = directory.resolve("nested").apply { mkdir() }
+        nested.resolve("hidden.so").writeText("fixture")
+        val other = folder.newFolder("other")
+        val outside = other.resolve("outside.so").apply { writeText("fixture") }
+        Files.createSymbolicLink(directory.resolve("linked.so").toPath(), outside.toPath())
+        Files.createSymbolicLink(directory.resolve("linked-folder").toPath(), other.toPath())
+        val alias = folder.root.resolve("alias")
+        Files.createSymbolicLink(alias.toPath(), directory.toPath())
+
+        val result = DirectoryScanner(runner()).scan(listOf(alias.absolutePath))
+        assertTrue(result.errors.isEmpty())
+        assertEquals(listOf(alias.resolve("direct.so").absolutePath), result.files.map { it.path })
     }
 
     @Test(timeout = 10000)

@@ -22,7 +22,8 @@ class ShellEscaperTest {
     fun `scan command is restricted to current directory`() {
         val command = buildScanCommand("/data/adb")
 
-        assertTrue(command.contains("find '/data/adb' -maxdepth 1"))
+        assertTrue(command.contains("find -H '/data/adb' -maxdepth 1"))
+        assertFalse(command.contains("find -L"))
         assertFalse(command.contains("-mindepth 2"))
     }
 

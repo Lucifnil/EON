@@ -5,6 +5,7 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOut
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Folder
@@ -47,8 +49,19 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp as lerpColor
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -394,6 +407,7 @@ private fun EonBottomBar(
         Row(
             Modifier
                 .fillMaxSize()
+                .clearAndSetSemantics { }
                 .graphicsLayer { translationX = panelOffset }
                 .padding(horizontal = horizontalInset),
             verticalAlignment = Alignment.CenterVertically,
@@ -415,9 +429,42 @@ private fun EonBottomBar(
             )
         }
 
-        // A single topmost gesture surface owns tap, press and horizontal drag.
-        // This prevents child click indications from cancelling the glass motion.
-        Box(Modifier.fillMaxSize().then(motion.modifier))
+        // One pointer handler owns all touch gestures. Semantics and keyboard
+        // activation share the page callback without adding a second tap handler.
+        Row(
+            Modifier
+                .fillMaxSize()
+                .then(motion.modifier)
+                .selectableGroup()
+                .padding(horizontal = horizontalInset),
+        ) {
+            tabs.forEachIndexed { index, tab ->
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxSize()
+                        .semantics {
+                            contentDescription = tab.label
+                            role = Role.Tab
+                            selected = pagePosition().roundToInt() == index
+                            onClick {
+                                onPageSelected(index)
+                                true
+                            }
+                        }
+                        .onKeyEvent { event ->
+                            when (event.key) {
+                                Key.Enter, Key.NumPadEnter, Key.DirectionCenter, Key.Spacebar -> {
+                                    if (event.type == KeyEventType.KeyUp) onPageSelected(index)
+                                    true
+                                }
+                                else -> false
+                            }
+                        }
+                        .focusable(),
+                )
+            }
+        }
     }
 }
 

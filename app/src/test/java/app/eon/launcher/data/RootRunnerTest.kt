@@ -3,6 +3,7 @@ package app.eon.launcher.data
 import app.eon.launcher.model.LogLine
 import app.eon.launcher.model.RootState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -15,6 +16,7 @@ import org.junit.rules.TemporaryFolder
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.io.File
 
 class RootRunnerTest {
     @get:Rule val folder = TemporaryFolder()
@@ -118,6 +120,75 @@ class RootRunnerTest {
         assertTrue(process!!.waitFor(2, TimeUnit.SECONDS))
         assertFalse(runner.isRunning())
         assertTrue(secret.all { it == '\u0000' })
+    }
+
+    @Test(timeout = 10000)
+    fun `cancel does not wait for a child holding output pipes`() = runBlocking {
+        val pidFile = folder.root.resolve("child.pid")
+        val runner = localRunner()
+        val secret = "secret".toCharArray()
+        val script = "read key; sleep 30 & printf '%s' \"\$!\" > ${ShellEscaper.quote(pidFile.path)}; wait"
+        val job = launch {
+            runner.launch("/bin/sh", folder.root.path, listOf("-c", script), secret) { _, _ -> }
+        }
+        val child = awaitChild(pidFile)
+        try {
+            // Let both readers enter a pipe read before cancellation.
+            delay(100L)
+            withTimeout(1500L) { job.cancelAndJoin() }
+            assertTrue(child.isAlive)
+            assertFalse(runner.isRunning())
+            assertTrue(secret.all { it == '\u0000' })
+            assertEquals(0, runner.launch("/bin/sh", folder.root.path, listOf("-c", "read key"), "next".toCharArray()) { _, _ -> })
+        } finally {
+            child.destroyForcibly()
+            job.cancelAndJoin()
+        }
+    }
+
+    @Test(timeout = 10000)
+    fun `parent exit drains available output without waiting for inherited pipes`() = runBlocking {
+        val pidFile = folder.root.resolve("child.pid")
+        val runner = localRunner()
+        val lines = Collections.synchronizedList(mutableListOf<String>())
+        val script = "read key; sleep 30 & printf '%s' \"\$!\" > ${ShellEscaper.quote(pidFile.path)}; sleep 0.2; printf 'finished\\n'; exit 7"
+        val job = async {
+            runner.launch("/bin/sh", folder.root.path, listOf("-c", script), "secret".toCharArray()) { _, text -> lines += text }
+        }
+        val child = awaitChild(pidFile)
+        try {
+            assertEquals(7, withTimeout(1500L) { job.await() })
+            assertEquals(listOf("finished"), lines)
+            assertTrue(child.isAlive)
+            assertFalse(runner.isRunning())
+        } finally {
+            child.destroyForcibly()
+            job.cancelAndJoin()
+        }
+    }
+
+    @Test(timeout = 10000)
+    fun `root timeout does not wait for a child holding output pipes`() = runBlocking {
+        val pidFile = folder.root.resolve("child.pid")
+        val script = "sleep 30 & printf '%s' \"\$!\" > ${ShellEscaper.quote(pidFile.path)}; while :; do :; done"
+        val runner = RootRunner(
+            startProcess = { ProcessBuilder("sh", "-c", script).start() },
+            commandTimeoutMillis = 300L,
+        )
+        val job = async { runner.checkRoot() }
+        val child = awaitChild(pidFile)
+        try {
+            assertEquals(RootState.DENIED, withTimeout(1500L) { job.await() })
+            assertTrue(child.isAlive)
+        } finally {
+            child.destroyForcibly()
+            job.cancelAndJoin()
+        }
+    }
+
+    private suspend fun awaitChild(pidFile: File): ProcessHandle = withTimeout(2000L) {
+        while (!pidFile.exists() || pidFile.length() == 0L) delay(5L)
+        ProcessHandle.of(pidFile.readText().trim().toLong()).orElseThrow()
     }
 
     @Test(timeout = 10000)

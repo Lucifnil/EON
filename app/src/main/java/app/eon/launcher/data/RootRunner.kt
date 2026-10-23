@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
+import java.io.InputStream
 import java.nio.charset.StandardCharsets
 
 class RootRunner(
@@ -91,8 +92,8 @@ class RootRunner(
             check(launchMutex.tryLock()) { "已有 SO 正在运行" }
             try {
                 return withProcess(buildLaunchCommand(path, workingDirectory, arguments)) { process ->
-                    val stdout = async { drain(process.inputStream.bufferedReader(), LogLine.Stream.STDOUT, secret, onLine) }
-                    val stderr = async { drain(process.errorStream.bufferedReader(), LogLine.Stream.STDERR, secret, onLine) }
+                    val stdout = async { drain(process.outputPipe(process.inputStream).bufferedReader(), LogLine.Stream.STDOUT, secret, onLine) }
+                    val stderr = async { drain(process.outputPipe(process.errorStream).bufferedReader(), LogLine.Stream.STDERR, secret, onLine) }
                     onStarted()
                     val input = async {
                         runInterruptible {
@@ -121,8 +122,8 @@ class RootRunner(
     private suspend fun command(command: String): CommandResult = withTimeoutOrNull(commandTimeoutMillis) {
         withProcess(command) { process ->
             process.outputStream.close()
-            val stdout = async { runInterruptible { readBounded(process.inputStream) } }
-            val stderr = async { runInterruptible { readBounded(process.errorStream) } }
+            val stdout = async { runInterruptible { readBounded(process.outputPipe(process.inputStream)) } }
+            val stderr = async { runInterruptible { readBounded(process.outputPipe(process.errorStream)) } }
             val code = runInterruptible { process.waitFor() }
             CommandResult(stdout.await(), stderr.await().toString(StandardCharsets.UTF_8).trim(), code)
         }
@@ -139,7 +140,7 @@ class RootRunner(
                         currentCoroutineContext().ensureActive()
                         block(process)
                     } finally {
-                        // Kill before coroutineScope joins potentially blocked pipe readers.
+                        // Readers exit on interruption even if descendants keep the pipes open.
                         if (process.isAlive) process.destroyForcibly()
                     }
                 }
@@ -147,6 +148,8 @@ class RootRunner(
                 closeProcess(process)
             }
         }
+
+    private fun Process.outputPipe(stream: InputStream) = ProcessPipeInputStream(stream) { isAlive }
 
     private suspend fun drain(
         reader: java.io.Reader,
@@ -189,7 +192,8 @@ internal fun buildLaunchCommand(path: String, workingDirectory: String, argument
 
 internal fun buildScanCommand(directory: String): String {
     val inspect = "for path do if [ -x \"\$path\" ]; then printf '1\\000%s\\000' \"\$path\"; else printf '0\\000%s\\000' \"\$path\"; fi; done"
-    return "find ${ShellEscaper.quote(directory)} -maxdepth 1 -type f -name '*.so' -exec sh -c ${ShellEscaper.quote(inspect)} sh {} +"
+    // Follow only the configured root, retaining its path without following child links.
+    return "find -H ${ShellEscaper.quote(directory)} -maxdepth 1 -type f -name '*.so' -exec sh -c ${ShellEscaper.quote(inspect)} sh {} +"
 }
 
 internal fun parseScanOutput(bytes: ByteArray): List<SoFile> {
