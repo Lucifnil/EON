@@ -133,6 +133,11 @@ fun EonApp(viewModel: EonViewModel = viewModel()) {
             if (showSettings) {
                 SettingsScreen(
                     onBack = { showSettings = false },
+                    scanPaths = state.scanPaths,
+                    scanErrors = state.scanErrors,
+                    onBrowseDirectory = viewModel::browseDirectory,
+                    onAddScanPath = viewModel::addScanPath,
+                    onRemoveScanPath = viewModel::removeScanPath,
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
@@ -159,6 +164,9 @@ fun EonApp(viewModel: EonViewModel = viewModel()) {
                             onRootRetry = viewModel::checkRoot,
                             onSettings = { showSettings = true },
                             onFileClick = { viewModel.clearMessage(); selectedFile = it },
+                            onTipSeen = viewModel::markScanTipSeen,
+                            onDismissTip = viewModel::dismissScanTip,
+                            isActive = pagerState.settledPage == page,
                         )
                         1 -> KeysScreen(
                             keys = state.keys,

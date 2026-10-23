@@ -10,6 +10,9 @@ import app.eon.launcher.data.buildLaunchCommand
 import app.eon.launcher.data.KeyVault
 import app.eon.launcher.data.LogPolicy
 import app.eon.launcher.data.RootRunner
+import app.eon.launcher.data.DirectoryScanner
+import app.eon.launcher.data.ScanPathPolicy
+import app.eon.launcher.data.ScanPathRepository
 import app.eon.launcher.model.EonUiState
 import app.eon.launcher.model.LogLine
 import app.eon.launcher.model.ProcessStatus
@@ -20,6 +23,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,11 +40,16 @@ class EonViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("eon_settings", Context.MODE_PRIVATE)
     private val vault = KeyVault(application)
     private val runner = RootRunner()
+    private val pathRepository = ScanPathRepository(application)
+    private val directoryScanner = DirectoryScanner(runner)
+    private val pathChanges = Mutex()
     private var launchJob: Job? = null
     private var rootCheckJob: Job? = null
+    private var scanJob: Job? = null
     private val _state = MutableStateFlow(
         EonUiState(
-            scanDirectory = SCAN_DIRECTORY,
+            scanPaths = pathRepository.paths(),
+            showScanPathTip = pathRepository.shouldShowTip(),
         ),
     )
     val state: StateFlow<EonUiState> = _state.asStateFlow()
@@ -64,15 +75,64 @@ class EonViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun scan() {
-        if (_state.value.isScanning) return
+        scanJob?.cancel()
+        val paths = _state.value.scanPaths
+        if (paths.isEmpty() || _state.value.rootState != RootState.READY) {
+            _state.update { it.copy(files = emptyList(), scanErrors = emptyMap(), isScanning = false) }
+            return
+        }
         _state.update { it.copy(isScanning = true, message = null) }
-        viewModelScope.launch {
-            runCatchingCancellable { runner.scan(SCAN_DIRECTORY) }
-                .onSuccess { files -> _state.update { it.copy(files = mergeRunMetadata(files), isScanning = false) } }
+        scanJob = viewModelScope.launch {
+            runCatchingCancellable { directoryScanner.scan(paths) }
+                .onSuccess { result ->
+                    _state.update { it.copy(files = mergeRunMetadata(result.files), scanErrors = result.errors, isScanning = false) }
+                }
                 .onFailure { error ->
                     _state.update { it.copy(isScanning = false, message = error.message ?: "扫描失败") }
                 }
         }
+    }
+
+    suspend fun browseDirectory(path: String) = runner.browseDirectory(path)
+
+    // The ViewModel owns writes so a picker recreation cannot persist a path
+    // without also updating the live configuration and scan results.
+    suspend fun addScanPath(path: String): Boolean = viewModelScope.async {
+        pathChanges.withLock {
+            val canonical = runner.resolveDirectory(path)
+            val added = withContext(Dispatchers.IO) { pathRepository.add(canonical) }
+            if (added) {
+                _state.update { it.copy(rootState = RootState.READY) }
+                updateScanPaths()
+            }
+            added
+        }
+    }.await()
+
+    fun removeScanPath(path: String) {
+        viewModelScope.launch {
+            runCatchingCancellable {
+                pathChanges.withLock {
+                    withContext(Dispatchers.IO) { pathRepository.remove(path) }
+                    updateScanPaths()
+                }
+            }.onFailure { error -> _state.update { it.copy(message = error.message ?: "移除扫描路径失败") } }
+        }
+    }
+
+    fun markScanTipSeen() = pathRepository.markTipSeen()
+
+    fun dismissScanTip() {
+        markScanTipSeen()
+        _state.update { it.copy(showScanPathTip = false) }
+    }
+
+    private fun updateScanPaths() {
+        scanJob?.cancel()
+        val paths = pathRepository.paths()
+        _state.update { it.copy(scanPaths = paths, files = emptyList(), scanErrors = emptyMap(), isScanning = false) }
+        dismissScanTip()
+        scan()
     }
 
     fun setQuery(value: String) = _state.update { it.copy(query = value) }
@@ -137,8 +197,8 @@ class EonViewModel(application: Application) : AndroidViewModel(application) {
             secret.fill('\u0000')
             return false
         }
-        if (file.directory != SCAN_DIRECTORY || !file.name.endsWith(".so")) {
-            _state.update { it.copy(message = "目标文件不在 /data/adb 当前目录") }
+        if (!ScanPathPolicy.allowsFile(_state.value.scanPaths, file.path)) {
+            _state.update { it.copy(message = "目标文件不在当前扫描路径中") }
             secret.fill('\u0000')
             return false
         }
@@ -163,9 +223,12 @@ class EonViewModel(application: Application) : AndroidViewModel(application) {
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             try {
                 runCatchingCancellable {
+                    check(runner.isExecutableFile(file.path)) { "目标文件已失效或不可执行，请重新扫描" }
+                    check(ScanPathPolicy.allowsFile(_state.value.scanPaths, file.path)) { "该扫描路径已移除" }
                     runner.launch(
                         file.path, workingDirectory, tokens, secret,
                         onStarted = {
+                            check(ScanPathPolicy.allowsFile(_state.value.scanPaths, file.path)) { "该扫描路径已移除" }
                             rememberLaunchKey(file.path, selectedKeyId, secret)
                             _state.update { it.copy(run = it.run.copy(status = ProcessStatus.RUNNING)) }
                         },
@@ -259,7 +322,6 @@ class EonViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val MAX_LOG_LINES = 500
-        const val SCAN_DIRECTORY = "/data/adb"
     }
 }
 

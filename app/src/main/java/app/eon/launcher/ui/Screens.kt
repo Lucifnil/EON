@@ -62,7 +62,6 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,7 +74,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -83,7 +81,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.DialogWindowProvider
 import app.eon.launcher.BuildConfig
 import app.eon.launcher.model.EonUiState
 import app.eon.launcher.model.KeySummary
@@ -92,10 +89,14 @@ import app.eon.launcher.model.ProcessStatus
 import app.eon.launcher.model.RootState
 import app.eon.launcher.model.RunState
 import app.eon.launcher.model.SoFile
+import app.eon.launcher.model.DirectoryListing
+import app.eon.launcher.data.ScanPathPolicy
 import app.eon.launcher.ui.components.EonGlassState
 import app.eon.launcher.ui.components.EonDialog
 import app.eon.launcher.ui.components.KeyVaultRow
-import app.eon.launcher.ui.components.applyEonNavigationBar
+import app.eon.launcher.ui.components.ScanPathsCard
+import app.eon.launcher.ui.components.DirectoryPicker
+import app.eon.launcher.ui.components.EonDialogSystemBars
 import app.eon.launcher.ui.components.eonGlass
 import app.eon.launcher.ui.theme.EonBackground
 import app.eon.launcher.ui.theme.EonBlue
@@ -119,7 +120,12 @@ fun FilesScreen(
     onRootRetry: () -> Unit,
     onSettings: () -> Unit,
     onFileClick: (SoFile) -> Unit,
+    onTipSeen: () -> Unit,
+    onDismissTip: () -> Unit,
+    isActive: Boolean,
 ) {
+    val showTip = isActive && state.showScanPathTip && state.rootState == RootState.READY && state.scanPaths.isNotEmpty()
+    LaunchedEffect(showTip) { if (showTip) onTipSeen() }
     val visibleFiles = remember(state.files, state.query) {
         state.files.filter {
             state.query.isBlank() || it.name.contains(state.query, true) || it.path.contains(state.query, true)
@@ -175,11 +181,36 @@ fun FilesScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
         }
+        if (showTip) item {
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Color.White).padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("默认扫描 ${ScanPathPolicy.DEFAULT_PATH}，可在设置中添加目录。", color = EonSecondary, fontSize = 13.sp)
+                    TextButton(onClick = { onDismissTip(); onSettings() }, contentPadding = PaddingValues(0.dp)) { Text("管理路径", color = EonBlue) }
+                }
+                IconButton(onClick = onDismissTip) { Icon(Icons.Default.Close, "关闭提示", tint = EonSecondary) }
+            }
+        }
+        if (state.scanErrors.isNotEmpty()) item {
+            TextButton(onClick = onSettings) { Text("${state.scanErrors.size} 个路径无法访问 · 管理路径", color = EonRed, fontSize = 13.sp) }
+        }
         if (!state.isScanning && visibleFiles.isEmpty()) {
             item {
                 EmptyState(
-                    title = if (state.query.isBlank()) "没有找到 .so 文件" else "没有匹配结果",
-                    body = if (state.query.isBlank()) "检查 Root 授权与扫描目录：${state.scanDirectory}" else "尝试搜索其他名称或路径",
+                    title = when {
+                        state.scanPaths.isEmpty() -> "尚未设置扫描路径"
+                        state.query.isNotBlank() -> "没有匹配结果"
+                        state.scanErrors.size == state.scanPaths.size -> "扫描路径暂时无法访问"
+                        else -> "没有找到 .so 文件"
+                    },
+                    body = when {
+                        state.scanPaths.isEmpty() -> "添加目录后即可扫描 .so 文件。"
+                        state.query.isNotBlank() -> "尝试搜索其他名称或路径"
+                        else -> "检查 Root 授权与扫描路径。"
+                    },
+                    action = if (state.scanPaths.isEmpty()) ({ TextButton(onClick = onSettings) { Text("设置扫描路径", color = EonBlue) } }) else null,
                 )
             }
         }
@@ -419,8 +450,14 @@ fun LogsScreen(run: RunState, onStop: () -> Unit, onClear: () -> Unit) {
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
+    scanPaths: List<String>,
+    scanErrors: Map<String, String>,
+    onBrowseDirectory: suspend (String) -> DirectoryListing,
+    onAddScanPath: suspend (String) -> Boolean,
+    onRemoveScanPath: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var selectingDirectory by remember { mutableStateOf(false) }
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 36.dp),
@@ -433,18 +470,22 @@ fun SettingsScreen(
             }
         }
         item {
-            SettingsCard("扫描") {
-                Text("/data/adb", fontWeight = FontWeight.Medium)
-                Text("仅扫描该目录当前层级，不读取任何子目录。", color = EonSecondary, fontSize = 13.sp)
-            }
+            ScanPathsCard(scanPaths, scanErrors, onAdd = { selectingDirectory = true }, onRemove = onRemoveScanPath)
         }
         item {
             SettingsCard("关于") {
                 Text("EON ${BuildConfig.VERSION_NAME}", fontWeight = FontWeight.SemiBold)
-                Text("EON 需要设备提供 su Root 环境。普通共享库无法直接启动，目标必须是可执行 ELF。应用不会自动 chmod、移动或修改 /data/adb 中的文件。", color = EonSecondary, fontSize = 13.sp, lineHeight = 19.sp)
+                Text("EON 需要设备提供 su Root 环境。普通共享库无法直接启动，目标必须是可执行 ELF。应用不会自动 chmod、移动或修改目标文件。", color = EonSecondary, fontSize = 13.sp, lineHeight = 19.sp)
             }
         }
     }
+    if (selectingDirectory) DirectoryPicker(
+        initialPath = scanPaths.firstOrNull() ?: "/",
+        existingPaths = scanPaths,
+        onBrowse = onBrowseDirectory,
+        onAdd = onAddScanPath,
+        onDismiss = { selectingDirectory = false },
+    )
 }
 
 @Composable
@@ -503,7 +544,7 @@ fun LaunchSheet(
         dragHandle = null,
         contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
     ) {
-        SheetNavigationBarAppearance()
+        EonDialogSystemBars()
         Column(
             Modifier
                 .fillMaxWidth()
@@ -618,14 +659,6 @@ fun LaunchSheet(
     }
 }
 
-@Composable
-private fun SheetNavigationBarAppearance() {
-    val view = LocalView.current
-    SideEffect {
-        (view.parent as? DialogWindowProvider)?.window?.applyEonNavigationBar(view)
-    }
-}
-
 private enum class LaunchKeyMode { MANUAL, SAVED }
 
 @Composable
@@ -717,7 +750,7 @@ private fun EonHeader(
 }
 
 @Composable
-private fun EmptyState(title: String, body: String) {
+private fun EmptyState(title: String, body: String, action: (@Composable () -> Unit)? = null) {
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Color.White).padding(22.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -725,6 +758,7 @@ private fun EmptyState(title: String, body: String) {
     ) {
         Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
         Text(body, color = EonSecondary, fontSize = 13.sp, lineHeight = 19.sp)
+        action?.invoke()
     }
 }
 

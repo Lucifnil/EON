@@ -14,6 +14,8 @@ data class SoFile(
 
 data class KeySummary(val id: String, val name: String)
 
+data class DirectoryListing(val path: String, val children: List<String>)
+
 enum class ProcessStatus { IDLE, STARTING, RUNNING, STOPPING, FINISHED, FAILED }
 
 data class LogLine(
@@ -34,7 +36,9 @@ data class RunState(
 
 data class EonUiState(
     val rootState: RootState = RootState.CHECKING,
-    val scanDirectory: String = "/data/adb",
+    val scanPaths: List<String> = emptyList(),
+    val scanErrors: Map<String, String> = emptyMap(),
+    val showScanPathTip: Boolean = false,
     val isScanning: Boolean = false,
     val files: List<SoFile> = emptyList(),
     val query: String = "",
